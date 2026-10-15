@@ -3312,6 +3312,42 @@ function trackWriteQueue(list) {
         localStorage.setItem(TRACK_QUEUE_KEY, JSON.stringify(list.slice(-200)));
     } catch (e) {}
 }
+function trackLastError() {
+    try {
+        return localStorage.getItem("yl2026_track_last_error") || "";
+    } catch (e) {
+        return "";
+    }
+}
+function trackSetLastError(text) {
+    try {
+        localStorage.setItem("yl2026_track_last_error", String(text).slice(0, 500));
+    } catch (e) {}
+}
+function trackSend(records) {
+    const headers = {
+        "Content-Type": "application/json",
+        Prefer: "return=minimal"
+    };
+    if (TRACK_CONFIG.token) {
+        headers.Authorization = "Bearer " + TRACK_CONFIG.token;
+        headers.apikey = TRACK_CONFIG.token;
+    }
+    return fetch(TRACK_CONFIG.endpoint, {
+        method: "POST",
+        headers: headers,
+        body: JSON.stringify(records),
+        keepalive: true
+    }).then((response) => {
+        if (response.ok) {
+            return { ok: true };
+        }
+        return response.text().then((text) => {
+            return { ok: false, status: response.status, message: text.slice(0, 300) };
+        });
+    });
+}
+/* 上报：只有真正发送成功的记录才会从队列移除 */
 function trackFlush() {
     if (!TRACK_CONFIG.enabled || !TRACK_CONFIG.endpoint) {
         return;
@@ -3321,79 +3357,45 @@ function trackFlush() {
         return;
     }
     const batch = queue.slice(0, 20).map(trackNormalize);
-    const headers = {
-        "Content-Type": "application/json",
-        Prefer: "return=minimal"
-    };
-    if (TRACK_CONFIG.token) {
-        headers.Authorization = "Bearer " + TRACK_CONFIG.token;
-        headers.apikey = TRACK_CONFIG.token;
-    }
-    try {
-        fetch(TRACK_CONFIG.endpoint, {
-            method: "POST",
-            headers: headers,
-            body: JSON.stringify(batch),
-            keepalive: true
-        }).then((response) => {
-            if (!response.ok) {
-                response.text().then((text) => {
-                    console.warn("[TRACK] 上报失败", response.status, text.slice(0, 300));
-                    if (response.status === 401 || response.status === 403) {
-                        console.warn(
-                            "[TRACK] 权限被拒。请在 Supabase SQL Editor 执行：\n" +
-                            "grant usage on schema public to anon;\n" +
-                            "grant insert, select on table yl_progress to anon;\n" +
-                            "alter table yl_progress disable row level security;"
-                        );
-                    }
-                    /* 整批失败时逐条重发，避免一条脏数据卡住整批 */
-                    if (batch.length > 1) {
-                        setTimeout(() => {
-                            trackSendOneByOne(batch);
-                        }, 500);
-                    }
-                }).catch(() => {});
-                return;
-            }
-            const rest = queue.slice(batch.length);
-            trackWriteQueue(rest);
-            if (rest.length) {
+    trackSend(batch).then((result) => {
+        if (result.ok) {
+            trackSetLastError("");
+            trackWriteQueue(queue.slice(batch.length));
+            if (trackReadQueue().length) {
                 setTimeout(trackFlush, 800);
             }
-        }).catch(() => {
-            if (batch.length > 1) {
-                setTimeout(() => {
-                    trackSendOneByOne(batch);
-                }, 500);
-            }
-        });
-    } catch (e) {}
-}
-/* 整批失败时逐条发送：能发出去的先发，最后只留真正失败的那条 */
-function trackSendOneByOne(batch) {
-    let index = 0;
-    const next = () => {
-        if (index >= batch.length) {
-            const queue = trackReadQueue();
-            trackWriteQueue(queue.slice(1));
             return;
         }
-        const item = batch[index];
-        index += 1;
-        const headers = {
-            "Content-Type": "application/json",
-            Prefer: "return=minimal"
-        };
-        if (TRACK_CONFIG.token) {
-            headers.Authorization = "Bearer " + TRACK_CONFIG.token;
-            headers.apikey = TRACK_CONFIG.token;
+        trackSetLastError(result.status + " " + result.message);
+        console.warn("[TRACK] 批量上报失败", result.status, result.message);
+        /* 整批失败时逐条发送，只移除成功的那几条 */
+        trackSendOneByOne(queue, batch);
+    }).catch((error) => {
+        trackSetLastError("网络异常：" + error.message);
+        trackSendOneByOne(queue, batch);
+    });
+}
+/* 整批失败时逐条发送：逐条记录成败，最后只移除成功的部分 */
+function trackSendOneByOne(queue, batch) {
+    let index = 0;
+    let sent = 0;
+    const next = () => {
+        if (index >= batch.length) {
+            if (sent > 0) {
+                /* 只移除真正发送成功的条数，失败的留在队列里等下次重试 */
+                trackWriteQueue(trackReadQueue().slice(sent));
+            }
+            return;
         }
-        fetch(TRACK_CONFIG.endpoint, {
-            method: "POST",
-            headers: headers,
-            body: JSON.stringify([item])
-        }).then(() => {
+        const current = batch[index];
+        index += 1;
+        trackSend([current]).then((result) => {
+            if (result.ok) {
+                sent += 1;
+            } else {
+                trackSetLastError("单条 " + result.status + " " + result.message);
+                console.warn("[TRACK] 单条上报失败", result.status, result.message);
+            }
             next();
         }).catch(() => {
             next();
@@ -3445,6 +3447,11 @@ window.__ylTrack = {
     peek: () => {
         const q = trackReadQueue();
         return q.length ? Object.keys(q[q.length - 1]) : [];
+    },
+    lastError: () => trackLastError(),
+    probe: async () => {
+        const result = await trackSend([trackNormalize(trackSnapshot())]);
+        return result;
     },
     status: () => {
         return {
